@@ -1,0 +1,23 @@
+---
+title: "Initalizing_Landscape"
+output: html_document
+---
+Bring in need packages
+```{r}
+library(terra)
+library(sf)
+library(dplyr)
+library(ggplot2)
+set.seed(123)
+
+```
+
+Pull in lanscape shp
+```{r}
+Landscape<- st_read("C:/Users/dinardo/LANDIS/NM_Masters_Thesis/NM_Conifer_Regen_Failure/StudyArea_shp/StudyArea.shp")
+#look at it
+plot(st_geometry(Landscape))
+```
+
+
+
