@@ -14,10 +14,15 @@ set.seed(123)
 
 Pull in lanscape shp
 ```{r}
-Landscape<- st_read("C:/Users/dinardo/LANDIS/NM_Masters_Thesis/NM_Conifer_Regen_Failure/StudyArea_shp/StudyArea.shp")
+shp<- st_read("C:/Users/dinardo/LANDIS/NM_Masters_Thesis/NM_Conifer_Regen_Failure/StudyArea_shp/StudyArea.shp")
+wkt <- 'PROJCS["North_America_Lambert_Conformal_Conic",GEOGCS["GCS_North_American_1983",DATUM["D_North_American_1983",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.017453292519943295]],PROJECTION["Lambert_Conformal_Conic"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-108.0],PARAMETER["Standard_Parallel_1",32.0],PARAMETER["Standard_Parallel_2",36.0],PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]'
+Landscape <- st_set_crs(shp, wkt)
+Landscape<- st_transform(Landscape, crs = 4326)
 #look at it
 plot(st_geometry(Landscape))
 ```
+Shp is in, I will be working in 90x90 meters resolution
 
+Time to create an initial climate region map
 
 
