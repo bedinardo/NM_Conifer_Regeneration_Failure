@@ -1,0 +1,1610 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+# Download PRISM data for historical
+
+This code downloads and processes daily PRISM 800-meter resolution climate data for each National PArk (we just have to change the ecoregion input in the loop and run it for each park). PRISM (Parameter-elevation Regressions on Independent Slopes Model) is a high-resolution climate dataset produced by Oregon State University and provides gridded estimates of daily weather variables across the U.S. from 1981 to the present.
+
+In this workflow, we:
+	•	Download daily gridded PRISM data for four climate variables: minimum temperature (tmin), maximum temperature (tmax), precipitation (ppt), and dew point temperature (tdmean) using the official PRISM web service.
+	•	Automatically retry failed downloads with exponential backoff and log successful retrievals to a file.
+	•	Use a parallelized loop (future_lapply) to speed up processing across available CPU cores.
+	•	Project and resample each downloaded raster to match a pre-defined ecoregion raster representing climate zones within Olympic National Park.
+	•	Use zonal averaging to summarize the mean value of each climate variable by ecoregion for each day.
+	•	Store the results in a single tidy CSV file with one row per ecoregion per day from 1981–2024.
+
+The result is a complete, ecoregion-specific historical daily climate dataset ready for LANDIS-II.
+
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load("httr", "utils", "terra", "sf", "exactextractr", "future", "future.apply", "progressr", 'tidyverse', 'glue') # these are the libraries we are using
+options(scipen=999) # no sci notation
+
+setwd("/Volumes/BigStore/PNW_Parks/Spatial/")
+setwd("/Users/jlamping/Dropbox (University of Oregon)/Lamping/NPS_postdoc/Spatial/")
+# PRISM 800m Daily Downloader and Ecoregion Summarizer
+
+# Set output directories
+download_dir <- "Climate/prism_800m"
+out_csv <- "Climate/outputs/prism_800m_daily_allparks.csv"
+out_dir <- "Climate/outputs/prism_800m_daily"
+
+# Function to download and unzip one day of PRISM data
+download_prism_day <- function(variable, date, out_dir, retries = 3, timeout_sec = 60) {
+  library(httr)
+  library(glue)
+
+  date <- as.Date(date)
+  base_url <- "https://services.nacse.org/prism/data/get/us/800m"
+  url <- paste0(base_url, "/", variable, "/", format(date, "%Y%m%d"))
+  zip_path <- file.path(out_dir, paste0(variable, "_", format(date, "%Y%m%d"), ".zip"))
+
+  # Skip if already downloaded
+  if (!file.exists(zip_path)) {
+    attempt <- 1
+    success <- FALSE
+
+    while (attempt <= retries && !success) {
+      resp <- try(
+        GET(url, write_disk(zip_path, overwrite = TRUE), timeout(timeout_sec)),
+        silent = TRUE
+      )
+      success <- inherits(resp, "response") && resp$status_code == 200
+
+      if (!success) {
+        message(glue("⏳ Retry {attempt}/{retries} for {url}..."))
+        Sys.sleep(3 * attempt)  # exponential backoff
+        attempt <- attempt + 1
+      }
+    }
+
+    if (!success) {
+      message("❌ Failed to download after retries: ", url)
+      return(NULL)
+    }
+  }
+
+  unzip_dir <- file.path(out_dir, paste0(variable, "_", format(date, "%Y%m%d")))
+  if (!dir.exists(unzip_dir)) {
+    try(unzip(zip_path, exdir = unzip_dir), silent = TRUE)
+  }
+
+  # ✅ Log success
+  log_dir <- "outputs/logs"
+  dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
+  write(format(date, "%Y-%m-%d"), file = file.path(log_dir, "downloaded_dates.txt"), append = TRUE)
+
+  return(unzip_dir)
+}
+
+# Define variables and date range
+vars <- c("tmin", "tmax", "ppt", "tdmean")
+
+# Include full year
+dates <- seq(as.Date("1981-01-01"), as.Date("2024-12-31"), by = "day")
+
+# Parallel plan
+plan(multisession, workers = parallel::detectCores() - 1)
+
+with_progress({
+  p <- progressor(along = dates)
+
+  all_results <- future_lapply(dates, function(date) {
+
+    library(terra)
+    library(httr)
+    library(utils)
+
+    # Load ecoregion raster inside worker
+    ecoregion_raster <- rast("Ecoregions/Raster/MORA_ClimateRegions.tif")
+
+    day_stack <- list()
+
+    for (v in vars) {
+
+      folder <- download_prism_day(v, as.Date(date), out_dir = download_dir)
+      if (is.null(folder)) return(NULL)
+
+      tif <- list.files(folder, pattern = "\\.tif$", full.names = TRUE)
+      if (length(tif) == 0 || !file.exists(tif[1])) return(NULL)
+
+      r <- rast(tif)
+
+      # ==========================================================
+      # FIX 1: Properly treat PRISM NoData before interpolation
+      # ==========================================================
+      # PRISM commonly uses -9999 as NoData
+      try(terra::NAflag(r) <- -9999, silent = TRUE)
+
+      # For precipitation, any negative value is invalid.
+      # Remove BEFORE resampling to prevent bilinear bleed.
+      if (v == "ppt") {
+        r[r < 0] <- NA
+      }
+
+      # Project and resample
+      r <- project(r, crs(ecoregion_raster))
+      r <- resample(r, ecoregion_raster, method = "bilinear")
+
+      # ==========================================================
+      # FIX 2: Safety clamp for ppt after resampling
+      # ==========================================================
+      if (v == "ppt") {
+        r[r < 0] <- 0
+      }
+
+      names(r) <- v
+      day_stack[[v]] <- r
+    }
+
+    if (length(day_stack) == length(vars)) {
+
+      stack <- rast(day_stack)
+
+      zonal_stats <- as.data.frame(
+        terra::zonal(stack, ecoregion_raster,
+                     fun = "mean", na.rm = TRUE)
+      )
+
+      names(zonal_stats)[1] <- "ecoregion"
+      zonal_stats$date <- date
+
+      # Cleanup downloaded files
+      for (v in vars) {
+        folder <- file.path(download_dir,
+                            paste0(v, "_", format(as.Date(date), "%Y%m%d")))
+        zip_path <- file.path(download_dir,
+                              paste0(v, "_", format(as.Date(date), "%Y%m%d"), ".zip"))
+
+        try(unlink(folder, recursive = TRUE), silent = TRUE)
+        try(unlink(zip_path), silent = TRUE)
+      }
+
+      p()
+      return(zonal_stats)
+
+    } else {
+      p()
+      return(NULL)
+    }
+
+  }, future.seed = TRUE)
+})
+
+climate_df <- bind_rows(all_results) %>%
+  mutate(date = as.Date(date)) %>%
+  select(date, ecoregion, tmin, tmax, ppt, tdmean)
+
+# write final historical climate data from PRISM
+write.csv(climate_df, "Climate/outputs/hist_prism_800m_daily_MORA_03032026.csv", row.names = FALSE)
+
+# Lets plots some of the results
+OLYM_climate_df = read_csv("Climate/outputs/hist_prism_800m_daily_OLYM_02272026.csv")
+MORA_climate_df = read_csv("Climate/outputs/hist_prism_800m_daily_MORA_03032026.csv")
+NOCA_climate_df = read_csv("Climate/outputs/hist_prism_800m_daily_NOCA_03032026.csv")
+
+# Aggregate to monthly tmax per ecoregion
+OLYM_tmax_monthly_df <- OLYM_climate_df %>%
+  filter(!is.na(tmax)) %>%
+  mutate(
+    year = year(date),
+    month = month(date),
+    ecoregion = factor(ecoregion),
+    month_date = as.Date(paste(year, month, "15", sep = "-"))  # mid-month for x-axis
+  ) %>%
+  group_by(ecoregion, month_date) %>%
+  summarize(tmax = mean(tmax, na.rm = TRUE), .groups = "drop")
+# Aggregate to monthly tmax per ecoregion
+OLYM_ppt_monthly_df <- OLYM_climate_df %>%
+  filter(!is.na(tmax)) %>%
+  mutate(
+    year = year(date),
+    month = month(date),
+    ecoregion = factor(ecoregion),
+    month_date = as.Date(paste(year, month, "15", sep = "-"))  # mid-month for x-axis
+  ) %>%
+  group_by(ecoregion, month_date) %>%
+  summarize(ppt = mean(ppt, na.rm = TRUE), .groups = "drop")
+# Aggregate to monthly tmax per ecoregion
+MORA_tmax_monthly_df <- MORA_climate_df %>%
+  filter(!is.na(tmax)) %>%
+  mutate(
+    year = year(date),
+    month = month(date),
+    ecoregion = factor(ecoregion),
+    month_date = as.Date(paste(year, month, "15", sep = "-"))  # mid-month for x-axis
+  ) %>%
+  filter(year >= 1989) %>%
+  group_by(ecoregion, month_date) %>%
+  summarize(tmax = mean(tmax, na.rm = TRUE), .groups = "drop")
+# Aggregate to monthly tmax per ecoregion
+MORA_ppt_monthly_df <- MORA_climate_df %>%
+  filter(!is.na(tmax)) %>%
+  mutate(
+    year = year(date),
+    month = month(date),
+    ecoregion = factor(ecoregion),
+    month_date = as.Date(paste(year, month, "15", sep = "-"))  # mid-month for x-axis
+  ) %>%
+  filter(year >= 1989) %>%
+  group_by(ecoregion, month_date) %>%
+  summarize(ppt = mean(ppt, na.rm = TRUE), .groups = "drop")
+# Aggregate to monthly tmax per ecoregion
+NOCA_tmax_monthly_df <- NOCA_climate_df %>%
+  filter(!is.na(tmax)) %>%
+  mutate(
+    year = year(date),
+    month = month(date),
+    ecoregion = factor(ecoregion),
+    month_date = as.Date(paste(year, month, "15", sep = "-"))  # mid-month for x-axis
+  ) %>%
+  group_by(ecoregion, month_date) %>%
+  summarize(tmax = mean(tmax, na.rm = TRUE), .groups = "drop")
+# Aggregate to monthly tmax per ecoregion
+NOCA_ppt_monthly_df <- NOCA_climate_df %>%
+  filter(!is.na(tmax)) %>%
+  mutate(
+    year = year(date),
+    month = month(date),
+    ecoregion = factor(ecoregion),
+    month_date = as.Date(paste(year, month, "15", sep = "-"))  # mid-month for x-axis
+  ) %>%
+  group_by(ecoregion, month_date) %>%
+  summarize(ppt = mean(ppt, na.rm = TRUE), .groups = "drop")
+# Aggregate to yearly tmax per ecoregion
+MORA_tmax_annual_df <- MORA_climate_df %>%
+  filter(!is.na(tmax)) %>%
+  mutate(
+    year = year(date),
+    month = month(date),
+    ecoregion = factor(ecoregion),
+    month_date = as.Date(paste(year, month, "15", sep = "-"))  # mid-month for x-axis
+  ) %>%
+  filter(year >= 1989) %>%
+  group_by(ecoregion, year) %>%
+  summarize(tmax = mean(tmax, na.rm = TRUE), .groups = "drop")
+
+
+# Plot with trend line
+# OLYM maxtemp
+ggplot(OLYM_tmax_monthly_df, aes(x = month_date, y = tmax, color = ecoregion)) +
+  geom_line(alpha = 0.5, linewidth = 0.4) +
+  geom_smooth(aes(group = 1), method = "loess", span = 0.2, se = FALSE, color = "black", linewidth = 1) +
+  labs(
+    title = "Monthly Mean Maximum Temperature by Ecoregion",
+    subtitle = "PRISM 800m, OLYM (1981–2024)",
+    x = "Year",
+    y = "Tmax (°C)",
+    color = "Ecoregion"
+  ) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  scale_color_viridis_d() +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+# OLYM Pricip
+ggplot(OLYM_ppt_monthly_df, aes(x = month_date, y = ppt, color = ecoregion)) +
+  geom_line(alpha = 0.5, linewidth = 0.4) +
+  geom_smooth(aes(group = 1), method = "loess", span = 0.2, se = FALSE, color = "black", linewidth = 1) +
+  labs(
+    title = "Monthly Precipitation by Ecoregion",
+    subtitle = "PRISM 800m, OLYM (1981–2024)",
+    x = "Year",
+    y = "Precipitation (cm)",
+    color = "Ecoregion"
+  ) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  scale_color_viridis_d() +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+# MORA maxtemp
+ggplot(MORA_tmax_monthly_df, aes(x = month_date, y = tmax, color = ecoregion)) +
+  geom_line(alpha = 0.5, linewidth = 0.4) +
+  geom_smooth(aes(group = 1), method = "loess", span = 0.2, se = FALSE, color = "black", linewidth = 1) +
+  labs(
+    title = "Monthly Mean Maximum Temperature by Ecoregion",
+    subtitle = "PRISM 800m, MORA (1981–2024)",
+    x = "Year",
+    y = "Tmax (°C)",
+    color = "Ecoregion"
+  ) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  scale_color_viridis_d() +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+# MORA Pricip
+ggplot(MORA_ppt_monthly_df, aes(x = month_date, y = ppt, color = ecoregion)) +
+  geom_line(alpha = 0.5, linewidth = 0.4) +
+  geom_smooth(aes(group = 1), method = "loess", span = 0.2, se = FALSE, color = "black", linewidth = 1) +
+  labs(
+    title = "Monthly Precipitation by Ecoregion",
+    subtitle = "PRISM 800m, MORA (1981–2024)",
+    x = "Year",
+    y = "Precipitation (cm)",
+    color = "Ecoregion"
+  ) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  scale_color_viridis_d() +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+# NOCA maxtemp
+ggplot(NOCA_tmax_monthly_df, aes(x = month_date, y = tmax, color = ecoregion)) +
+  geom_line(alpha = 0.5, linewidth = 0.4) +
+  geom_smooth(aes(group = 1), method = "loess", span = 0.2, se = FALSE, color = "black", linewidth = 1) +
+  labs(
+    title = "Monthly Mean Maximum Temperature by Ecoregion",
+    subtitle = "PRISM 800m, NOCA (1981–2024)",
+    x = "Year",
+    y = "Tmax (°C)",
+    color = "Ecoregion"
+  ) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  scale_color_viridis_d() +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+# NOCA Pricip
+ggplot(NOCA_ppt_monthly_df, aes(x = month_date, y = ppt, color = ecoregion)) +
+  geom_line(alpha = 0.5, linewidth = 0.4) +
+  geom_smooth(aes(group = 1), method = "loess", span = 0.2, se = FALSE, color = "black", linewidth = 1) +
+  labs(
+    title = "Monthly Precipitation by Ecoregion",
+    subtitle = "PRISM 800m, NOCA (1981–2024)",
+    x = "Year",
+    y = "Precipitation (cm)",
+    color = "Ecoregion"
+  ) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  scale_color_viridis_d() +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+# NOCA tmax annual
+ggplot(MORA_tmax_annual_df, aes(x = as.Date(year), y = tmax, color = ecoregion)) +
+  geom_line(alpha = 0.5, linewidth = 0.4) +
+  geom_smooth(aes(group = 1), method = "loess", span = 0.2, se = FALSE, color = "black", linewidth = 1) +
+  labs(
+    title = "Annual Tmax by Ecoregion",
+    subtitle = "PRISM 800m, NOCA (1981–2024)",
+    x = "Year",
+    y = "Average Maximum Temp (C)",
+    color = "Ecoregion"
+  ) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  scale_color_viridis_d() +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+
+# They look good, but there giant gaps in years before 1988. Lets filter for 1988 - 2024 and also reformat for the correct LANDIS climate structure.
+# OLYM
+OLYM_landis_climate_df <- OLYM_climate_df %>%
+  filter(year(date) >= 1988) %>%
+  mutate(
+    Year = year(date),
+    Month = month(date),
+    Day = day(date)
+  ) %>%
+  pivot_longer(
+    cols = c(tmin, tmax, ppt, tdmean),
+    names_to = "Variable",
+    values_to = "Value"
+  ) %>%
+  select(Year, Month, Day, Variable, ecoregion, Value) %>%
+  pivot_wider(
+    names_from = ecoregion,
+    values_from = Value,
+    names_sort = TRUE
+  ) %>%
+  arrange(Year, Month, Day, Variable) %>%
+  mutate(Variable = case_when(
+    Variable == "tdmean" ~ "dewpoint",
+    .default = Variable
+  ))
+# MORA
+MORA_landis_climate_df <- MORA_climate_df %>%
+  filter(year(date) >= 1988) %>%
+  mutate(
+    Year = year(date),
+    Month = month(date),
+    Day = day(date)
+  ) %>%
+  pivot_longer(
+    cols = c(tmin, tmax, ppt, tdmean),
+    names_to = "Variable",
+    values_to = "Value"
+  ) %>%
+  select(Year, Month, Day, Variable, ecoregion, Value) %>%
+  pivot_wider(
+    names_from = ecoregion,
+    values_from = Value,
+    names_sort = TRUE
+  ) %>%
+  arrange(Year, Month, Day, Variable) %>%
+  mutate(Variable = case_when(
+    Variable == "tdmean" ~ "dewpoint",
+    .default = Variable
+  ))
+# NOCA
+NOCA_landis_climate_df <- NOCA_climate_df %>%
+  filter(year(date) >= 1988) %>%
+  mutate(
+    Year = year(date),
+    Month = month(date),
+    Day = day(date)
+  ) %>%
+  pivot_longer(
+    cols = c(tmin, tmax, ppt, tdmean),
+    names_to = "Variable",
+    values_to = "Value"
+  ) %>%
+  select(Year, Month, Day, Variable, ecoregion, Value) %>%
+  pivot_wider(
+    names_from = ecoregion,
+    values_from = Value,
+    names_sort = TRUE
+  ) %>%
+  arrange(Year, Month, Day, Variable) %>%
+  mutate(Variable = case_when(
+    Variable == "tdmean" ~ "dewpoint",
+    .default = Variable
+  ))
+
+# Export to CSV
+write_csv(OLYM_landis_climate_df, "Climate/outputs/hist_prism_800m_daily_1988-2024_OLYM_03032026.csv")
+write_csv(MORA_landis_climate_df, "Climate/outputs/hist_prism_800m_daily_1988-2024_MORA_03032026.csv")
+write_csv(NOCA_landis_climate_df, "Climate/outputs/hist_prism_800m_daily_1988-2024_NOCA_03032026.csv")
+```
+
+After running this through LANDIS it looks like there might be some missing dates in the dataset. Lets take a look and see how many and if we can easily fill them.
+```{r}
+# Load required libraries
+library(dplyr)
+library(readr)
+library(lubridate)
+setwd("/Users/jlamping/Dropbox (University of Oregon)/Lamping/NPS_postdoc")
+
+# Load original climate dataset. Loop through and do this for the different landscapes
+climate_df <- read_csv("Spatial/Climate/outputs/hist_prism_800m_daily_1988-2024_NOCA_03032026.csv") %>%
+  mutate(Date = make_date(Year, Month, Day),
+         Source = "original") %>% # flag original rows
+  filter(Year >= 1989) %>%
+  select(-eco0)
+
+# Create complete daily date sequence
+expected_dates <- tibble(Date = seq.Date(as.Date("1989-01-01"), as.Date("2024-12-31"), by = "day"))
+
+# Extract all unique variables
+variables <- unique(climate_df$Variable)
+
+# Build full expected (Date × Variable) matrix
+expected_matrix <- expand.grid(Date = expected_dates$Date,
+                               Variable = variables,
+                               stringsAsFactors = FALSE) %>%
+  as_tibble() %>%
+  mutate(Month = month(Date),
+         Day   = day(Date))
+
+# Get actual (Date, Variable) pairs present
+actual_keys <- climate_df %>%
+  select(Date, Variable) %>%
+  distinct()
+
+# Identify missing (Date, Variable) pairs
+missing_matrix <- anti_join(expected_matrix, actual_keys, by = c("Date", "Variable"))
+
+# Add Month & Day to main dataset for sampling
+climate_df <- climate_df %>%
+  mutate(Month = month(Date),
+         Day   = day(Date))
+
+# Fill missing by randomly sampling from other years with same Month/Day/Variable
+# filled_rows <- missing_matrix %>%
+#   select(Date, Variable) %>%
+#   rowwise() %>%
+#   mutate(Fill_Row = list({
+#     pool <- climate_df %>%
+#       filter(Variable == Variable,
+#              Month == month(Date),
+#              Day == day(Date))
+# 
+#     #if (nrow(pool) == 0) return(NULL)
+# 
+#     sample_row <- sample_n(pool, 1) %>%
+#       mutate(Year = year(Date),
+#              Month = month(Date),
+#              Day = day(Date),
+#              Date = Date,
+#              Source = "filled")
+#     sample_row
+#   })) %>%
+#   tidyr::unnest(Fill_Row, names_sep = "_")
+
+filled_rows <- missing_matrix %>%
+  select(Date, Variable) %>%
+  rowwise() %>%
+  mutate(Fill_Row = list({
+
+    current_var  <- Variable
+    current_date <- Date
+
+    pool <- climate_df %>%
+      filter(
+        Variable == current_var,
+        Month == month(current_date),
+        Day   == day(current_date)
+      )
+
+    sample_row <- sample_n(pool, 1) %>%
+      mutate(
+        Year  = year(current_date),
+        Month = month(current_date),
+        Day   = day(current_date),
+        Date  = current_date,
+        Source = "filled"
+      )
+
+    sample_row
+  })) %>%
+  tidyr::unnest(Fill_Row, names_sep = "_")
+
+# Reformat the unnested filled rows to match climate_df column names
+# filled_rows_clean <- filled_rows %>%
+#   transmute(
+#     Year    = year(Date),
+#     Month   = month(Date),
+#     Day     = day(Date),
+#     Variable = Variable,
+#     Source   = Fill_Row_Source,
+#     Date     = Date,
+#     across(starts_with("Fill_Row_eco"), .names = "{str_replace(.col, 'Fill_Row_', '')}")
+#   )
+filled_rows_clean <- filled_rows %>%
+  transmute(
+    Year    = year(Date),
+    Month   = month(Date),
+    Day     = day(Date),
+    Variable = Variable,
+    Source   = Fill_Row_Source,
+    Date     = Date,
+    across(starts_with("Fill_Row_eco"), 
+           .names = "{str_replace(.col, 'Fill_Row_', '')}")
+  )
+
+# Now combine with the original dataset
+climate_complete <- bind_rows(climate_df, filled_rows_clean) %>%
+  arrange(Date) %>% select(-c(Date, Source))
+
+# # Optional: check that it's complete now
+# expected_final <- expand.grid(Date = expected_dates$Date,
+#                               Variable = variables,
+#                               stringsAsFactors = FALSE)
+# 
+# missing_after <- anti_join(expected_final,
+#                            climate_complete %>% select(Date, Variable),
+#                            by = c("Date", "Variable"))
+# 
+# stopifnot(nrow(missing_after) == 0)
+
+# Convert only ppt values from mm to cm
+# Get the eco columns (assuming they are named exactly "eco1" to "eco22")
+eco_cols <- paste0("eco", 1:22)
+# Convert only ppt rows for those columns
+climate_complete[climate_complete$Variable == "ppt", eco_cols] <- 
+  climate_complete[climate_complete$Variable == "ppt", eco_cols] / 10
+# # No missing dates for MORA, just fix ppt and write
+# climate_df[climate_df$Variable == "ppt", eco_cols] <- 
+#   climate_df[climate_df$Variable == "ppt", eco_cols] / 10
+# LOOKS GOOOOOOOOOD!!!
+write_csv(climate_complete, "Spatial/Climate/outputs/hist_prism_800m_daily_1989-2024_MORA_03032026_filled.csv")
+
+# # write without dewpoint for initial testing
+# write_csv(climate_complete %>% filter(Variable != "tdmean"),
+#           "LANDIS/initial_landscapes/OLYM/extensions/hist_prism_800m_daily_1988-2024_OLYM_NoDew.csv")
+```
+
+# Future climate
+```{r}
+################################################################################
+#  NEX‑GDDP‑CMIP6 ▸ Washington State subset ▸ R version
+#  Models  : CanESM5, HadGEM3‑GC31‑LL, CNRM‑CM6‑1, GFDL‑ESM4, MRI‑ESM2‑0
+#  Scenarios: ssp126 (SSP1‑2.6), ssp245 (SSP2‑4.5), ssp370 (SSP3‑7.0)
+#  Variables: tas tasmax tasmin pr rsds rlds hurs huss sfcWind
+#  Period  : 2015‑01‑01 to 2100‑12‑31
+#  Output  : one cropped NetCDF per model‑scenario‑variable
+################################################################################
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load("aws.s3", "terra", "stringr", "dplyr", "purrr", 'progress', 'glue', 'ncdf4', "furrr", "future", "prism", "exactextractr", "sf", "data.table", "future.apply") # these are the libraries we are using
+#pak::pkg_install("mt-climate-office/cmip6@*release")
+# set working directory where you want the data downloaded
+setwd("/Volumes/BigStore/PNW_Parks/Spatial/Climate/")
+setwd("/Users/jlamping/Dropbox (University of Oregon)/Lamping/NPS_postdoc/Spatial/Climate/")
+setwd("/Users/jameslamping/Dropbox (University of Oregon)/Lamping/NPS_postdoc/Spatial/Climate/")
+options(scipen=999) # no sci notation
+```
+
+Script Description: 
+  This section of code queries the NASA NEX-GDDP-CMIP6 archive hosted on AWS, 
+  identifies valid daily NetCDF files for selected GCMs, scenarios, and variables, 
+  and downloads them in parallel using {furrr}. 
+
+  For each file, it:
+    1. Crops the raster to a bounding box around Washington State,
+    2. Subsets to daily data from 2015–2100,
+    3. Rotates longitudes from 0–360 to -180–180,
+    4. Writes the cropped and cleaned NetCDF to disk using LANDIS-compatible naming.
+
+  Output:
+    One NetCDF file per model × scenario × variable covering 2015–2100 and 
+    spatially cropped to the study region.
+
+  Dependencies:
+    - aws.s3, terra, glue, furrr, future, dplyr, stringr
+    - AWS public S3 access (no credentials required)
+
+```{r}
+Sys.setenv("AWS_DEFAULT_REGION" = "us-west-2")
+bucket <- "nex-gddp-cmip6"
+
+# ── User-specified inputs ─────────────────────────────────────────────────────
+models <- c("CNRM-CM6-1", "GFDL-ESM4", "MRI-ESM2-0", "CanESM5", "HadGEM3-GC31-LL",
+            "ACCESS-CM2", "ACCESS-ESM1-5", "CMCC-ESM2", "CNRM-ESM2-1", "EC-Earth3",
+            "EC-Earth3-Veg-LR", "FGOALS-g3", "GISS-E2-1-G", "INM-CM4-8", "INM-CM5-0",
+            "KACE-1-0-G", "MIROC-ES2L", "MPI-ESM1-2HR", "MPI-ESM1-2-LR", "NorESM2-LM",
+            "NorESM2-MM", "TaiESM1")
+scenarios  <- c("ssp370", "ssp585")
+# variant_map <- c(
+#   "CNRM-CM6-1" = "r1i1p1f2",
+#   "GFDL-ESM4" = "r1i1p1f1",
+#   "MRI-ESM2-0" = "r1i1p1f1",
+#   "CanESM5" = "r1i1p1f1",
+#   "HadGEM3-GC31-LL" = "r1i1p1f3"
+# )
+
+#vars_keep <- c("tas","tasmax","tasmin","pr","rsds","rlds","hurs","huss","sfcWind")
+vars_keep <- c("tasmax","tasmin", "pr", "huss","sfcWind")
+bbox <- ext(-125, -116, 45, 49)
+bbox <- vect(bbox, crs = "epsg:4326")
+bbox_native <- project(bbox, crs("OGC:CRS84"))
+out_dir   <- "./nex_gddp_wa_3"
+#dir.create(out_dir, showWarnings = FALSE)
+
+# ── Step 1: Collect valid file paths from AWS ─────────────────────────────────
+get_valid_keys_df <- function(models, scenarios, vars_keep) {
+  # Build prefixes for all model-scenario-variant combinations
+  prefixes <- expand.grid(models = models, scenarios = scenarios) %>%
+    #mutate(variant = variant_map[models]) %>%
+    mutate(prefix = glue("NEX-GDDP-CMIP6/{models}/{scenarios}/")) %>%
+    #mutate(prefix = glue("NEX-GDDP-CMIP6/{models}/{scenarios}/{variant}/")) %>%
+    pull(prefix)
+  
+  # Pull all file keys for the model-scenario-variant combos
+  all_files <- bind_rows(
+    lapply(prefixes, function(prefix) {
+      rbindlist(
+        get_bucket(
+              bucket = bucket,
+              prefix = prefix,
+              max = Inf,
+              use_https = TRUE,
+              region = "us-west-2",
+              url_style = "path"
+            ),
+        use.names = TRUE, fill = TRUE) #%>% select(Key)
+    })
+  )
+  
+  # Add columns for filtering
+  all_files <- all_files %>%
+    mutate(model = str_extract(Key, paste(models, collapse = "|")),
+           scenario = str_extract(Key, paste(scenarios, collapse = "|")),
+           variant = str_split(Key, "/", simplify = TRUE)[, 4],
+           variable = str_extract(Key, paste(vars_keep, collapse = "|")),
+           version = str_extract(Key, "v[0-9]+\\.[0-9]+")) 
+  
+  return(all_files)
+}
+
+all_files_df <- get_valid_keys_df(models, scenarios, vars_keep)
+
+# Filter to just v2.0 files
+valid_files_df <- all_files_df %>%
+  filter(version == "v2.0") %>% filter(!is.na(scenario)) %>% filter(!is.na(variable))
+  #select(Key)
+
+# Create summary table to check that we have all the scenarios and variables we want for each model
+print(
+  valid_files_df %>%
+  distinct(model, scenario, variable) %>%
+  group_by(model) %>%
+  summarise(
+    scenarios = toString(sort(unique(scenario))),
+    variables = toString(sort(unique(variable))),
+    .groups = "drop")
+  )
+
+# Extract just the "key" column as a character vector for downloading
+all_keys <- valid_files_df$Key
+
+length(all_keys)  # sanity check
+
+# Funtion to download and process all identified AWS paths using future
+process_one_file <- function(key) {
+  # Ensure bucket is globally available
+  bucket <- "nex-gddp-cmip6"
+  out_dir <- out_dir
+  bbox <- vect(ext(-125, -116, 45, 49), crs = "epsg:4326")
+  bbox_native <- project(bbox, crs("OGC:CRS84"))
+
+  # Extract components from the key
+  #key = all_keys[1]
+  filename <- basename(key)
+  parts <- unlist(str_split(filename, "_"))
+  var <- parts[1]
+  model <- parts[3]
+  scen <- parts[4]
+
+  # Set output file path
+  out_file <- file.path(out_dir, glue("{model}_{scen}_{var}_WA_{parts[7]}"))
+
+  # Skip if already processed
+  if (file.exists(out_file)) {
+    message("✅ Already exists: ", out_file)
+    return(NULL)
+  }
+
+  # Process the NetCDF file
+  tmp <- tempfile(fileext = ".nc")
+  tryCatch({
+    save_object(key, bucket = bucket, file = tmp,
+                use_https = TRUE, region = "us-west-2")
+    r <- rast(tmp)
+    time_index <- time(r)
+    keep_times <- which(time_index >= as.Date("2015-01-01") & time_index <= as.Date("2100-12-31"))
+    r <- subset(r, keep_times)
+    r <- terra::rotate(r)  # Fix longitude
+    r <- crop(r, bbox_native, snap = "out")
+    writeCDF(r, paste0(out_file, ".nc"),
+             overwrite = TRUE,
+             varname = var, xname = "lon", yname = "lat",
+             varunit = terra::units(r)[1])
+    unlink(tmp)
+    unlink(r)
+    #message("✅ Wrote: ", out_file)
+  }, error = function(e) {
+    message("❌ Failed: ", key)
+  })
+  r
+}
+
+# Apply to all valid keys on single core
+#walk(all_keys[1:2], process_one_file)
+
+# Set up parallel plan
+plan(multisession, workers = 18)  # adjust to your CPU
+
+# Run in parallel with progress bar
+future_walk(all_keys, process_one_file, .progress = TRUE)
+
+```
+
+# Download check
+
+Lets run a quick check to see if we have what we need for all the models we wanted.
+```{r}
+library(tidyverse)
+library(fs)
+library(stringr)
+library(ggplot2)
+setwd("/Volumes/BigStore/PNW_Parks/Spatial/Climate")
+
+# Adjust this path to where your downloaded NetCDF files are stored
+output_dir <- "nex_gddp_wa_2"
+
+# List all downloaded files
+files <- dir_ls(output_dir, glob = "*.nc")
+
+# Extract metadata: model, scenario, variable, year
+file_info <- tibble(file = basename(files)) %>%
+  mutate(
+    model     = str_extract(file, "^[^_]+"),
+    scenario  = str_extract(file, "(ssp\\d{3})"),
+    variable  = str_extract(file, "(tas|tasmax|tasmin|pr|rsds|rlds|hurs|huss|sfcWind)"),
+    year      = str_extract(file, "_20\\d{2}\\.nc$") %>% str_remove_all("_|\\.nc") %>% as.integer(),
+    group     = paste(model, scenario, sep = "_")
+  )
+
+# Create presence matrix (1 = file exists for that year)
+coverage_df <- file_info %>%
+  distinct(group, year) %>%
+  mutate(present = 1)
+
+# Plot: presence matrix across years
+ggplot(coverage_df, aes(x = year, y = fct_rev(group), fill = factor(present))) +
+  geom_tile(color = "gray80") +
+  scale_fill_manual(values = c("1" = "forestgreen"), labels = c("Data Present")) +
+  labs(title = "Downloaded NEX-GDDP Climate Data Coverage by Model–Scenario",
+       x = "Year", y = "Model–Scenario", fill = "") +
+  theme_minimal(base_size = 14)
+```
+
+# This script processes daily NASA NEX-GDDP-CMIP6 NetCDF climate files for a given national park,
+# extracting spatial averages by ecoregion zone, converting them to LANDIS-II-compatible units and format,
+# and writing one CSV file per model–scenario group. The code performs spatial reprojection, resampling,
+# and zonal mean calculations in parallel using furrr and terra, and includes unit conversions 
+# (e.g., K to °C, mm/s to cm/day). Output files are structured by date and ecoregion for direct use 
+# in LANDIS-II climate libraries.
+
+```{r}
+library(terra)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(glue)
+library(furrr)
+library(future)
+library(progressr)
+library(tidyr)
+library(tidyverse)
+
+setwd("/Volumes/BigStore/PNW_Parks/Spatial/Climate/")
+setwd("/Users/jlamping/Dropbox (University of Oregon)/Lamping/NPS_postdoc/Spatial/Climate/")
+setwd("/Users/jameslamping/Dropbox (University of Oregon)/Lamping/NPS_postdoc/Spatial/Climate/")
+options(scipen=999) # no sci notation
+
+# --- Paths ---
+park = "NOCA"
+nc_dir <- "/Volumes/BigStore/PNW_Parks/Spatial/Climate/nex_gddp_wa_2"  # Folder with processed NetCDFs
+eco_raster_path <- glue("../../LANDIS/initial_landscapes/{park}/input_maps/{park}_ClimateRegions_09122025.tif")
+output_dir <- glue("outputs/Future_climate_processed/{park}")
+#dir.create(output_dir, showWarnings = FALSE)
+eco_r <- rast(eco_raster_path)  # load once instead of every day
+
+# --- List all NetCDFs ---
+nc_files <- list.files(nc_dir, pattern = "\\.nc$", full.names = TRUE)
+
+# --- Group files by model–scenario ---
+file_info <- tibble(file = nc_files) %>%
+  mutate(
+    name = basename(file),
+    model = str_split_i(name, "_", 1),
+    scenario = str_split_i(name, "_", 2),
+    variable = str_split_i(name, "_", 3),
+    year = str_split_i(name, "_", 5),
+    group = glue("{model}_{scenario}")
+    ) %>%
+  mutate(
+    year = as.integer(str_remove(year, ".nc"))) %>%
+  filter(scenario != "ssp245") %>% # not analyzing this scenario
+  filter(model != "CMCC-ESM2") %>%
+  filter(model != "MIROC-ES2L")
+
+# --- Loop over each group (model–variant–scenario) ---
+# --- Process each model-scenario group ---
+# ── Parallel plan ─────────────────────────────────────────────────────
+#plan(multisession, workers = 10)
+
+groups <- unique(file_info$group)
+groups = groups[-c(20, 25:26)]
+plan(multisession, workers = 8) #parallel::detectCores() - 10
+# --- Loop over each group (model + scenario) ---
+for (g in groups) {
+  #g = "ACCESS-CM2_ssp370"
+  message("Processing group: ", g)
+  sub_files <- file_info %>% filter(group == g)
+
+  with_progress({
+    p <- progressor(along = 1:nrow(sub_files))
+    
+    # process variable and years in parallel
+    group_df <- future_map_dfr(seq_len(nrow(sub_files)), function(i) {
+      #i = 1
+      park = "NOCA"
+      f = sub_files[i, ]$file
+      model = sub_files[i, ]$model
+      scenario = sub_files[i, ]$scenario
+      variable = sub_files[i, ]$variable
+      # Read stack and extract time info
+      eco_r <- rast(glue("../../LANDIS/initial_landscapes/{park}/input_maps/{park}_ClimateRegions_09122025.tif"))
+      names(eco_r) = "ecoregion"
+      r <- rast(f) #
+      dates <- as.Date(time(r))
+      names(r) <- dates
+      r = project(r, crs(eco_r))
+      r = resample(r, eco_r, method = "bilinear", threads = FALSE)
+      z <- as.data.frame(zonal(r, eco_r, fun = "mean", na.rm = TRUE))
+      rm(r)
+      terra::tmpFiles(remove = TRUE)
+      # Convert to long format
+      z_long <- z %>%
+        pivot_longer(
+          cols = -ecoregion,
+          names_to = "date",
+          values_to = "value"
+          ) %>%
+        mutate(
+          date = as.Date(date),
+          variable = variable,
+          model = model,
+          scenario = scenario
+          )
+      p()
+      return(z_long)}
+      ) # .options = furrr_options(globals = list(park = park, eco_r = eco_r, sub_files = sub_files), seed = TRUE)
+
+        ################################################################################
+    # Unit conversions: NASA NEX‑GDDP‑CMIP6  →  LANDIS‑II Climate Library
+    #
+    # Variable mapping + unit changes
+    #
+    # NASA name   → LANDIS name   | NASA units              → LANDIS units   | Conversion
+    # ------------------------------------------------------------------------------
+    # pr          → ppt           | kg m-2 s-1 (mm/s)       → cm/day         | value * 86400 / 10
+    # tasmax      → maxtemp       | Kelvin (K)              → °C             | value - 273.15
+    # tasmin      → mintemp       | Kelvin (K)              → °C             | value - 273.15
+    # huss        → SH            | kg/kg                   → g/kg           | value * 1000
+    # sfcWind     → windSpeed     | m/s                     → km/h           | value * 3.6
+    #
+    # Notes:
+    # • 1 kg m-2 water = 1 mm precipitation
+    # • 86400 sec/day converts rate → daily accumulation
+    # • ÷10 converts mm → cm
+    # • LANDIS expects:
+    #     ppt       = cm/day
+    #     temps     = °C
+    #     SH        = g/kg
+    #     windSpeed = km/h
+    ################################################################################
+    final_df = group_df %>%
+        mutate(
+          Year = year(date),
+          Month = month(date),
+          Day = day(date)
+        ) %>%
+        select(Year, Month, Day, variable, ecoregion, value) %>%
+        pivot_wider(
+          names_from = ecoregion,
+          values_from = value,
+          names_prefix = "eco"
+        ) %>%
+      # change names and units to what LANDIS needs
+      rename(Variable = variable) %>%
+      # variable names
+      mutate(Variable = case_when(
+          Variable == "pr" ~ "ppt",
+          Variable == "tasmax" ~ "maxtemp",
+          Variable == "tasmin" ~ "mintemp",
+          Variable == "huss" ~ "SH", # specific humidity
+          Variable == "sfcWind" ~ "windSpeed",
+          .default = Variable)) %>%
+      # units
+      mutate(across(starts_with("eco"), ~ case_when(
+        Variable == "ppt"       ~ .x * 86400 / 10,
+        Variable == "maxtemp"   ~ .x - 273.15,
+        Variable == "mintemp"   ~ .x - 273.15,
+        Variable == "SH"        ~ .x * 1000,
+        Variable == "windSpeed" ~ .x * 3.6,
+        TRUE ~ .x)))
+    }) 
+   
+  
+  # Save 
+  write_csv(final_df, glue("{output_dir}/{g}_{park}.csv"))
+  message("Saved: ", glue("{output_dir}/{g}_{park}.csv"))
+    
+  # Clean memory after each group
+  gc(verbose = FALSE)
+}
+
+```
+# Model comparison
+
+# This workflow ingests LANDIS-ready climate CSV outputs (daily values by ecoregion),
+# reshapes them to long format, computes spatial means across ecoregions, and
+# aggregates to annual metrics. Annual temperature is calculated as the mean of daily
+# values and precipitation as the annual sum (converted to cm). The script then:
+#   1) plots annual time-series comparisons across all model–scenario combinations, and
+#   2) computes early vs late period deltas (ΔT and ΔP%) to support a four-corners
+#      climate envelope selection for representative GCM/SSP scenarios.
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(fs)
+library(ggrepel)
+library(patchwork)
+
+# Path to folder with all OLYM CSVs
+climate_dir <- "outputs/Future_climate_processed/NOCA"
+
+# Load all climate files
+files <- dir_ls(climate_dir, regexp = "_NOCA\\.csv$")
+
+# Combine all into one dataframe
+climate_df <- map_dfr(files, function(f) {
+  df <- read_csv(f, show_col_types = FALSE)
+  meta <- str_match(basename(f), "^(.*?)_(.*?)_NOCA\\.csv$")
+  df$model <- meta[,2]
+  df$scenario <- meta[,3]
+  df
+}) %>% select(-eco0)
+
+# Average across ecoregions per day
+climate_daily <- climate_df %>%
+  pivot_longer(cols = starts_with("eco"), names_to = "ecozone", values_to = "value") %>%
+  #   mutate(variable = case_when(
+  #   variable == "pr" ~ "ppt",
+  #   variable == "tasmax" ~ "tmax",
+  #   variable == "tasmin"~ "tmin"
+  # )) %>%
+  group_by(model, scenario, Variable, Year, Month, Day) %>%
+  summarise(value = mean(value, na.rm = TRUE), .groups = "drop")
+
+# Compute annual mean per model/scenario/variable
+climate_annual <- climate_daily %>%
+  group_by(model, scenario, Variable, Year) %>%
+  summarise(annual_value = mean(value, na.rm = TRUE), .groups = "drop")
+
+# Compute annual values: sum for pr, mean for other variables
+# cm/yr = pr * 31,5557,600 seconds * 0.1 = pr * 3,155,760
+climate_annual_pr <- climate_daily %>%
+  # mutate(value = case_when(
+  #   variable == "ppt" ~ value * 86400 / 10,
+  #   .default = value)) %>%
+  group_by(model, scenario, Variable, Year) %>%
+  summarise(
+    annual_value = if_else(
+      Variable == "ppt",
+      sum(value, na.rm = TRUE),
+      mean(value, na.rm = TRUE)
+    )[1],
+    , .groups = "drop") #%>%
+ 
+
+# ─── PLOT: tasmax comparison ────────────────────────────────────────────────
+climate_annual_pr %>%
+  filter(Variable == "maxtemp") %>%
+  ggplot(aes(x = Year, y = annual_value, color = interaction(model, scenario))) +
+  geom_line(linewidth = 1) +
+  labs(title = "Annual Average tasmax (°K)",
+       y = "Temperature (°K)", x = "Year", color = "Model–Scenario") +
+  theme_minimal()
+
+# ─── PLOT: precipitation comparison ─────────────────────────────────────────
+climate_annual_pr %>%
+  filter(Variable == "ppt") %>%
+  ggplot(aes(x = Year, y = annual_value, color = interaction(model, scenario))) +
+  geom_line(linewidth = 1) +
+  labs(title = "Total Annual Precipitation",
+       y = "Precipitation (cm)", x = "Year", color = "Model–Scenario") +
+  theme_minimal()
+
+# ─── FOUR CORNERS SELECTION ─────────────────────────────────────────────────
+# ---- SETTINGS (EDIT THESE) ----
+begin_years <- 2015:2044
+end_years   <- 2071:2100
+vars <- c("maxtemp", "ppt")
+
+# ---- 1) PERIOD MEANS (BEGIN vs END) ----
+period_means <- climate_annual_pr %>%
+  filter(Variable %in% vars, Year >= 2015, Year <= 2100) %>%
+  mutate(period = case_when(
+    Year %in% begin_years ~ "begin",
+    Year %in% end_years   ~ "end",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(period)) %>%
+  group_by(model, scenario, Variable, period) %>%
+  summarise(period_mean = mean(annual_value, na.rm = TRUE), .groups = "drop")
+
+# ---- 2) WIDE + DELTAS ----
+deltas <- period_means %>%
+  pivot_wider(names_from = period, values_from = period_mean) %>%
+  filter(!is.na(begin), !is.na(end)) %>%
+  mutate(
+    # Temperature: if tmax is in Kelvin, ΔK == Δ°C (so this is Δ°C)
+    delta_abs = end - begin,
+    # Precip: percent change relative to begin
+    delta_pct = 100 * (end - begin) / begin
+  )
+
+corners_df <- deltas %>%
+  select(model, scenario, Variable, delta_abs, delta_pct) %>%
+  pivot_wider(
+    names_from = Variable,
+    values_from = c(delta_abs, delta_pct),
+    names_sep = "_"
+  ) %>%
+  transmute(
+    model,
+    scenario,
+    delta_T_C   = delta_abs_maxtemp,
+    delta_P_pct = delta_pct_ppt
+  ) %>%
+  filter(!is.na(delta_T_C), !is.na(delta_P_pct))
+
+# ---- 3) PLOT (ALL MODELS + ALL SSPS) ----
+# plot for each park
+NOCA_corner_plt = ggplot(corners_df, aes(x = delta_P_pct, y = delta_T_C, color = scenario)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, color = "grey40") +
+  geom_vline(xintercept = 0, linewidth = 0.4, color = "grey40") +
+  geom_point(size = 3, alpha = 0.9) +
+  ggrepel::geom_text_repel(
+    aes(label = model),
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.25,
+    point.padding = 0.15
+  ) +
+  labs(
+    title = paste0(
+      "NOCA Projected Precip & Temp Change (All SSPs)\n",
+      min(begin_years), "–", max(begin_years),
+      " to ",
+      min(end_years), "–", max(end_years)
+    ),
+    x = expression(Delta~"P (%)"),
+    y = expression(Delta~"T ("*degree*"C)"),
+    color = "Scenario"
+  ) +
+  theme_minimal()
+
+############################ Model Decision
+# Warm/Dry = ACCESS-CM2 ssp585
+# Warm/Wet = TaiESM1 ssp585
+# Cool/Dry = GISS-E2-1-G ssp370
+# Cool/Wet = INM-CM5-0 ssp370
+
+# stack plots
+(OLYM_corner_plt/MORA_corner_plt/NOCA_corner_plt) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+## adding historical data from PRISM
+# Load historical PRISM data
+prism_path <- "../../LANDIS/initial_landscapes/MORA/extensions/hist_prism_800m_daily_1988-2024_MORA_filled.csv"
+hist_df <- read_csv(prism_path, show_col_types = FALSE)
+
+# Add model and scenario columns
+hist_df <- hist_df %>%
+  mutate(model = "PRISM", scenario = "historical") %>%
+  rename(variable = Variable)
+
+# Combine historical + future
+climate_df_full <- bind_rows(climate_df, hist_df) %>%
+  mutate(variable = case_when(
+    variable == "pr" ~ "ppt",
+    variable == "tasmax" ~ "tmax",
+    variable == "tasmin"~ "tmin",
+    .default = variable
+  ))
+
+# Average across ecoregions per day
+climate_daily <- climate_df_full %>%
+  pivot_longer(cols = starts_with("eco"), names_to = "ecozone", values_to = "value") %>%
+  group_by(model, scenario, variable, Year, Month, Day) %>%
+  summarise(value = mean(value, na.rm = TRUE), .groups = "drop")
+
+# Annual mean tasmax etc.
+climate_annual <- climate_daily %>%
+  group_by(model, scenario, variable, Year) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(mean_value = case_when(
+    variable == "tmax" & model != "PRISM" ~ mean_value - 273.15,  # Convert kg/m²/s → cm/day
+    .default = mean_value # PRISM already in mm/day → cm/day
+  ))
+
+# Annual precipitation totals (converted to cm)
+climate_annual_pr <- climate_daily %>%
+  mutate(value = case_when(
+    variable == "ppt" & model != "PRISM" ~ value * 86400 / 10,  # Convert kg/m²/s → cm/day
+    TRUE ~ value  # PRISM already in mm/day → cm/day
+  )) %>%
+  group_by(model, scenario, variable, Year) %>%
+  summarise(annual_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  filter(model != "HadGEM3-GC31-LL")
+
+
+# TASMAX PLOT
+climate_annual %>%
+  filter(variable == "tmax") %>%
+  ggplot(aes(x = Year, y = mean_value, color = interaction(model, scenario))) +
+  geom_line(linewidth = 1) +
+  labs(title = "Annual Average tasmax (°C)",
+       y = "Temperature (°C)", x = "Year", color = "Model–Scenario") +
+  theme_minimal()
+
+# PRECIPITATION PLOT
+climate_annual_pr %>%
+  filter(variable == "ppt") %>%
+  ggplot(aes(x = Year, y = annual_value, color = interaction(model, scenario))) +
+  geom_line(linewidth = 1) +
+  labs(title = "Total Annual Precipitation (Historical + Future)",
+       y = "Precipitation (cm)", x = "Year", color = "Model–Scenario") +
+  theme_minimal()
+```
+
+# Climate Stream Figure - MaxTemp
+```{r}
+################################################################################
+# plot_NOCA_maxtemp_all_models.R
+#
+# Plots annual mean daily maximum temperature for:
+#   - All future climate model CSVs in the NOCA directory
+#   - Historic PRISM baseline
+#
+# Future CSVs: Variable == "maxtemp", spatial columns eco0:eco22
+# Historic CSV: Variable == "tmax",   spatial columns eco0:eco22
+#
+# Four "decision" models are highlighted; all others shown in grey.
+################################################################################
+ 
+library(tidyverse)
+library(scales)
+ 
+# ── Paths ─────────────────────────────────────────────────────────────────────
+future_dir  <- "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/Climate/outputs/Future_climate_processed/NOCA"
+historic_fp <- "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/Climate/outputs/hist_prism_800m_daily_1988-2024_NOCA_03032026.csv"
+ 
+# ── Helper: read one CSV and return annual mean tmax ──────────────────────────
+# Averages across all eco columns, then across all days within each year.
+read_annual_tmax <- function(filepath, var_label, tmax_varname) {
+  message("Reading: ", basename(filepath))
+  
+  df <- read_csv(filepath, show_col_types = FALSE)
+  
+  # Keep only rows matching the tmax variable
+  df <- df %>% filter(Variable == tmax_varname)
+  
+  # Identify eco columns (all numeric columns that aren't Year/Month/Day)
+  eco_cols <- df %>%
+    select(-Year, -Month, -Day, -Variable) %>%
+    select(where(is.numeric)) %>%
+    names()
+  
+  # Row-wise mean across eco columns → daily mean tmax across landscape
+  df <- df %>%
+    mutate(daily_mean_tmax = rowMeans(select(., all_of(eco_cols)), na.rm = TRUE))
+  
+  # Annual mean
+  df %>%
+    group_by(Year) %>%
+    summarise(annual_mean_tmax = mean(daily_mean_tmax, na.rm = TRUE),
+              .groups = "drop") %>%
+    mutate(model = var_label)
+}
+ 
+# ── Decision models (highlighted) ─────────────────────────────────────────────
+decision_models <- c(
+  "ACCESS-CM2_ssp585",   # Warm/Dry
+  "TaiESM1_ssp585",      # Warm/Wet
+  "GISS-E2-1-G_ssp370",  # Cool/Dry
+  "INM-CM5-0_ssp370"     # Cool/Wet
+)
+ 
+decision_labels <- c(
+  "ACCESS-CM2_ssp585"  = "Warm/Dry (ACCESS-CM2 ssp585)",
+  "TaiESM1_ssp585"     = "Warm/Wet (TaiESM1 ssp585)",
+  "GISS-E2-1-G_ssp370" = "Cool/Dry (GISS-E2-1-G ssp370)",
+  "INM-CM5-0_ssp370"   = "Cool/Wet (INM-CM5-0 ssp370)"
+)
+ 
+decision_colors <- c(
+  "Warm/Dry (ACCESS-CM2 ssp585)"   = "#D73027",   # red
+  "Warm/Wet (TaiESM1 ssp585)"      = "#FC8D59",   # orange
+  "Cool/Dry (GISS-E2-1-G ssp370)"  = "#4575B4",   # blue
+  "Cool/Wet (INM-CM5-0 ssp370)"    = "#74ADD1"    # light blue
+)
+ 
+# ── Read future model files ────────────────────────────────────────────────────
+csv_files <- list.files(future_dir, pattern = "\\.csv$", full.names = TRUE)
+ 
+future_data <- map_dfr(csv_files, function(fp) {
+  # Extract model name from filename, e.g. "ACCESS-CM2_ssp585_NOCA" → "ACCESS-CM2_ssp585"
+  model_name <- basename(fp) %>%
+    str_remove("_NOCA\\.csv$")
+  
+  read_annual_tmax(fp, var_label = model_name, tmax_varname = "maxtemp")
+})
+ 
+# ── Read historic PRISM ────────────────────────────────────────────────────────
+historic_data <- read_annual_tmax(historic_fp, var_label = "Historic PRISM", tmax_varname = "tmax")
+ 
+# ── Combine and classify ───────────────────────────────────────────────────────
+# Tag each future model as decision or background
+future_data <- future_data %>%
+  mutate(
+    series_type = if_else(model %in% decision_models, "decision", "background"),
+    display_label = case_when(
+      model %in% names(decision_labels) ~ decision_labels[model],
+      TRUE ~ model
+    )
+  )
+ 
+historic_data <- historic_data %>%
+  mutate(series_type = "historic", display_label = "Historic PRISM (1988–2024)")
+ 
+all_data <- bind_rows(future_data, historic_data)
+ 
+# ── Build plot layers ──────────────────────────────────────────────────────────
+ 
+# Split into background (grey), decision (colored), historic (black dashed)
+bg_data       <- filter(all_data, series_type == "background")
+decision_data <- filter(all_data, series_type == "decision") %>%
+                   mutate(display_label = factor(display_label, levels = names(decision_colors)))
+hist_data     <- filter(all_data, series_type == "historic")
+ 
+p <- ggplot() +
+  
+  # ── Background models (grey, thin) ──────────────────────────────────────────
+  geom_line(
+    data = bg_data,
+    aes(x = Year, y = annual_mean_tmax, group = model),
+    color = "grey70", linewidth = 0.35, alpha = 0.6
+  ) +
+  
+  # ── Decision models (colored, bold) ─────────────────────────────────────────
+  geom_line(
+    data = decision_data,
+    aes(x = Year, y = annual_mean_tmax, color = display_label, group = model),
+    linewidth = 1.0
+  ) +
+  
+  # ── Historic PRISM (black dashed) ────────────────────────────────────────────
+  geom_line(
+    data = hist_data,
+    aes(x = Year, y = annual_mean_tmax, linetype = display_label),
+    color = "black", linewidth = 1.1
+  ) +
+  
+  # ── Scales ───────────────────────────────────────────────────────────────────
+  scale_color_manual(
+    name   = "Selected Models",
+    values = decision_colors
+  ) +
+  scale_linetype_manual(
+    name   = "Observed",
+    values = c("Historic PRISM (1988–2024)" = "dashed")
+  ) +
+  
+  # Add a grey dummy entry in the color legend for "Other models"
+  # (done via annotate guide hack — simpler approach: add a note in caption)
+  
+  labs(
+    title    = "Annual Mean Daily Maximum Temperature — North Cascades NP (NOCA)",
+    subtitle = "All CMIP6 models shown; four decision models highlighted | Landscape-averaged across eco units",
+    x        = "Year",
+    y        = "Mean Daily Tmax (°C)",
+    caption  = "Grey lines = all other CMIP6 models. Decision models: Warm/Dry, Warm/Wet, Cool/Dry, Cool/Wet.\nHistoric: PRISM 800m daily (1988–2024)."
+  ) +
+  
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(size = 10, color = "grey40"),
+    legend.position  = "right",
+    legend.box       = "vertical",
+    legend.key.width = unit(1.5, "cm"),
+    panel.grid.minor = element_blank(),
+    plot.caption     = element_text(size = 8, color = "grey50", hjust = 0)
+  ) +
+  
+  # Separate legend for the historic line
+  guides(
+    color    = guide_legend(order = 1, override.aes = list(linewidth = 1.2)),
+    linetype = guide_legend(order = 2, override.aes = list(linewidth = 1.2))
+  )
+ 
+# ── Save ──────────────────────────────────────────────────────────────────────
+out_path <- "~/Dropbox (University of Oregon)/Lamping/NPS_postdoc/Spatial/Climate/NOCA_maxtemp_all_models.png"
+ 
+ggsave(
+  filename = out_path,
+  plot     = p,
+  width    = 14,
+  height   = 6,
+  dpi      = 300
+)
+ 
+message("Figure saved to: ", out_path)
+```
+
+# Climate Stream Figure - PPT
+```{r}
+################################################################################
+# plot_NOCA_ppt_all_models.R
+#
+# Plots annual total precipitation for:
+#   - All future climate model CSVs in the NOCA directory
+#   - Historic PRISM baseline
+#
+# Future CSVs: Variable == "ppt", spatial columns eco0:eco22
+# Historic CSV: Variable == "ppt", spatial columns eco0:eco22
+#
+# Four "decision" models are highlighted; all others shown in grey.
+################################################################################
+
+library(tidyverse)
+library(scales)
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+future_dir  <- "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/Climate/outputs/Future_climate_processed/MORA"
+historic_fp <- '/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/LANDIS/static_landscapes/NOCA/Hist/Rep1/extensions/hist_prism_with_GRIDMET_wind_MORA_03032026.csv'
+
+# ── Helper: read one CSV and return annual total ppt ──────────────────────────
+# Averages across all eco columns (landscape mean), then sums across days within each year.
+read_annual_ppt <- function(filepath, var_label) {
+  message("Reading: ", basename(filepath))
+  
+  df <- read_csv(filepath, show_col_types = FALSE)
+  
+  # Keep only rows matching ppt
+  df <- df %>% filter(Variable == "ppt")
+  
+  # Identify eco columns (all numeric columns that aren't Year/Month/Day)
+  eco_cols <- df %>%
+    select(-Year, -Month, -Day, -Variable) %>%
+    select(where(is.numeric)) %>%
+    names()
+  
+  # Row-wise mean across eco columns → daily mean ppt across landscape
+  df <- df %>%
+    mutate(daily_mean_ppt = rowMeans(select(., all_of(eco_cols)), na.rm = TRUE))
+  
+  # Annual total (sum of daily values)
+  df %>%
+    group_by(Year) %>%
+    summarise(annual_total_ppt = sum(daily_mean_ppt, na.rm = TRUE),
+              .groups = "drop") %>%
+    mutate(model = var_label)
+}
+
+# ── Decision models (highlighted) ─────────────────────────────────────────────
+decision_models <- c(
+  "ACCESS-CM2_ssp585",   # Warm/Dry
+  "TaiESM1_ssp585",      # Warm/Wet
+  "GISS-E2-1-G_ssp370",  # Cool/Dry
+  "INM-CM5-0_ssp370"     # Cool/Wet
+)
+
+decision_labels <- c(
+  "ACCESS-CM2_ssp585"   = "Warm/Dry (ACCESS-CM2 ssp585)",
+  "TaiESM1_ssp585"      = "Warm/Wet (TaiESM1 ssp585)",
+  "GISS-E2-1-G_ssp370"  = "Cool/Dry (GISS-E2-1-G ssp370)",
+  "INM-CM5-0_ssp370"    = "Cool/Wet (INM-CM5-0 ssp370)"
+)
+
+decision_colors <- c(
+  "Warm/Dry (ACCESS-CM2 ssp585)"   = "#D73027",   # red
+  "Warm/Wet (TaiESM1 ssp585)"      = "#FC8D59",   # orange
+  "Cool/Dry (GISS-E2-1-G ssp370)"  = "#4575B4",   # blue
+  "Cool/Wet (INM-CM5-0 ssp370)"    = "#74ADD1"    # light blue
+)
+
+# ── Read future model files ────────────────────────────────────────────────────
+csv_files <- list.files(future_dir, pattern = "\\.csv$", full.names = TRUE)
+
+future_data <- map_dfr(csv_files, function(fp) {
+  model_name <- basename(fp) %>%
+    str_remove("_NOCA\\.csv$")
+  
+  read_annual_ppt(fp, var_label = model_name)
+})
+
+# ── Read historic PRISM ────────────────────────────────────────────────────────
+historic_data <- read_annual_ppt(historic_fp, var_label = "Historic PRISM")
+
+# ── Combine and classify ───────────────────────────────────────────────────────
+future_data <- future_data %>%
+  mutate(
+    series_type   = if_else(model %in% decision_models, "decision", "background"),
+    display_label = case_when(
+      model %in% names(decision_labels) ~ decision_labels[model],
+      TRUE ~ model
+    )
+  )
+
+historic_data <- historic_data %>%
+  mutate(series_type = "historic", display_label = "Historic PRISM (1988–2024)")
+
+all_data <- bind_rows(future_data, historic_data)
+
+# ── Build plot layers ──────────────────────────────────────────────────────────
+bg_data       <- filter(all_data, series_type == "background")
+decision_data <- filter(all_data, series_type == "decision") %>%
+                   mutate(display_label = factor(display_label, levels = names(decision_colors)))
+hist_data     <- filter(all_data, series_type == "historic")
+
+p <- ggplot() +
+  
+  # ── Background models (grey, thin) ──────────────────────────────────────────
+  geom_line(
+    data = bg_data,
+    aes(x = Year, y = annual_total_ppt, group = model),
+    color = "grey70", linewidth = 0.35, alpha = 0.6
+  ) +
+  
+  # ── Decision models (colored, bold) ─────────────────────────────────────────
+  geom_line(
+    data = decision_data,
+    aes(x = Year, y = annual_total_ppt, color = display_label, group = model),
+    linewidth = 1.0
+  ) +
+  
+  # ── Historic PRISM (black dashed) ────────────────────────────────────────────
+  geom_line(
+    data = hist_data,
+    aes(x = Year, y = annual_total_ppt, linetype = display_label),
+    color = "black", linewidth = 1.1
+  ) +
+  
+  # ── Scales ───────────────────────────────────────────────────────────────────
+  scale_color_manual(
+    name   = "Selected Models",
+    values = decision_colors
+  ) +
+  scale_linetype_manual(
+    name   = "Observed",
+    values = c("Historic PRISM (1988–2024)" = "dashed")
+  ) +
+  scale_y_continuous(labels = comma) +
+  
+  labs(
+    title    = "Annual Total Precipitation — North Cascades NP (NOCA)",
+    subtitle = "All CMIP6 models shown; four decision models highlighted | Landscape-averaged across eco units",
+    x        = "Year",
+    y        = "Annual Total Precipitation (mm)",
+    caption  = "Grey lines = all other CMIP6 models. Decision models: Warm/Dry, Warm/Wet, Cool/Dry, Cool/Wet.\nHistoric: PRISM 800m daily (1988–2024)."
+  ) +
+  
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(size = 10, color = "grey40"),
+    legend.position  = "right",
+    legend.box       = "vertical",
+    legend.key.width = unit(1.5, "cm"),
+    panel.grid.minor = element_blank(),
+    plot.caption     = element_text(size = 8, color = "grey50", hjust = 0)
+  ) +
+  
+  guides(
+    color    = guide_legend(order = 1, override.aes = list(linewidth = 1.2)),
+    linetype = guide_legend(order = 2, override.aes = list(linewidth = 1.2))
+  )
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+out_path <- "~/Dropbox (University of Oregon)/Lamping/NPS_postdoc/Spatial/Climate/NOCA_ppt_all_models.png"
+
+ggsave(
+  filename = out_path,
+  plot     = p,
+  width    = 14,
+  height   = 6,
+  dpi      = 300
+)
+
+message("Figure saved to: ", out_path)
+```
+

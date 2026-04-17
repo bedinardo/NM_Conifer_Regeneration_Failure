@@ -1,0 +1,177 @@
+---
+title: "Making the ecoregions map Lauren-W"
+author: "Lauren Walker"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+This notebook creates the ecoregion map for landis-ii simulations. This script can be used for those using LOCA2 climate change data and making ecoregion map from that raster template. 
+
+```{r}
+library(terra)
+library(tidyverse)
+library(tidyterra)
+```
+
+
+Read in landscape extent and one future climate raster (Source: LOCA2, can be downloaded here: https://cirrus.ucsd.edu/~pierce/LOCA2/)
+```{r}
+# Define custom projection
+albers_custom <- "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-121 +datum=NAD83 +units=m +no_defs"
+
+# Load in landscape polygon perimeter and project
+landscape<-vect("Data/Landscape_extent/EAB_landscape_perimeter_new.shp") %>% project(albers_custom)
+
+# Load in one climate file, adjust longitude values, match projection
+futureclim<-rast("Data/Climate/Future/ACCESS-CM2/precip/pr.ACCESS-CM2.ssp585.r1i1p1f1.2015-2044.LOCA_16thdeg_v20240915.n_west.monthly.nc") %>% select(pr_tavg_1) %>% project(crs(landscape)) # %>% shift(dx=-360) 
+
+# Export raster to compare with ecoregion in arcgis
+#writeRaster(template, "Exports/climatetest.tif")
+```
+
+
+Create ecoregion map from landscape, resample to future climate template
+```{r}
+# Create template
+template <- rast(extent = ext(landscape), crs = crs(landscape), resolution=90)
+
+# Crop the template raster to match landscape extent
+futureclim_crop <- crop(futureclim, landscape)
+
+# Assign unique zone IDs to valid template cells (non-NA)
+valid_cells <- !is.na(values(futureclim_crop))
+values(futureclim_crop)[valid_cells] <- seq_len(sum(valid_cells))
+
+# Resample to 90m using template with nearest neighbor method
+ecoregions <- resample(futureclim_crop, template, method = "near")
+
+# Mask to the landscape boundary (optional)
+ecoregions <- mask(ecoregions, landscape)
+
+# Reassign values so they go from 1:N (in case some coarse zones are skipped)
+unique_vals <- sort(na.omit(unique(values(ecoregions))))
+id_map <- setNames(seq_along(unique_vals), unique_vals)
+ecoregions[] <- id_map[as.character(values(ecoregions))]
+
+# Plot to check
+plot(ecoregions)
+```
+
+
+NEW STEP: aggregate by factor of 200 because there's too many ecoregions.
+```{r}
+# Aggregate to coarser grid (e.g., 10x10 blocks => 900m)
+ecoreg_agg <- aggregate(ecoregions, fact = 200, fun = modal, na.rm = TRUE)
+
+# Relabel the super-ecoregions 1:N
+valid_cells <- !is.na(values(ecoreg_agg))
+values(ecoreg_agg)[valid_cells] <- seq_len(sum(valid_cells))
+plot(ecoreg_agg)
+
+# Resample to 90m 
+ecoreg_super <- resample(ecoreg_agg, ecoregions, method = "near")
+plot(ecoreg_masked)
+
+# Assign NAs from original ecoregion map to this one
+ecoreg_masked <- ifel(is.na(ecoregions), NA, ecoreg_super)
+
+# Fill NAs with zero to make raster a rectangle
+ecoreg_masked<- ifel(is.na(ecoreg_masked),0,ecoreg_masked)
+```
+
+
+Now we need to adjust the map for areas where we don't want to grow trees (disturbed, water, etc). TreeMap masks out areas based on LANDFIRE land cover data (Existing Vegetation Type, EVT) which includes human-modified or non-vegetated types from NLCD data.
+
+
+```{r}
+# Read in most recent NLCD land cover raster downloaded from https://www.usgs.gov/centers/eros/science/annual-national-land-cover-database
+landcover<-rast("Data/NLCD/Annual_NLCD_LndCov_2023_CU_C1V0_0uhEsq9q3JR5tsws3x2l.tiff")
+
+# Match projections
+landcover <- landcover %>% project(crs(ecoregions))
+
+# Resample first to match resolution/extent
+landcover_raster <- resample(landcover, ecoregions, method = "near")
+```
+
+Our designations:
+
+Ecoregion     Land cover class
+0             11 (open water), 12 (perennial snow and ice), 24 (Developed, high                intensity), 31 (barren land)
+1             23 (Developed, medium intensity)
+2             22 (Developed, low intensity)
+3             21 (Developed, open space)
+4             81 (hay/pasture), 82 (cultivated crops)
+
+
+(We might want to exclude a few more categories based on TreeMap if it looks bad!!!)
+
+
+```{r}
+# Step 1: Identify border pixels (original zeros)
+border_mask <- ecoreg_masked == 0
+
+# Step 2: Initialize output with ecoregion + 4 (for non-border cells)
+out_rast <- ecoreg_masked + 4
+
+# Step 3: Apply land cover rules — only overwrite interior values
+out_rast <- ifel(landcover_raster %in% c(11, 12, 24, 31), 0, out_rast)
+out_rast <- ifel(landcover_raster == 23, 1, out_rast)
+out_rast <- ifel(landcover_raster == 22, 2, out_rast)
+out_rast <- ifel(landcover_raster == 21, 3, out_rast)
+out_rast <- ifel(landcover_raster %in% c(81, 82), 4, out_rast)
+
+# Step 4: Now restore original zeros
+out_rast <- ifel(border_mask, 0, out_rast)
+
+# Export raster
+writeRaster(out_rast, "Data/NECN_Final_Maps/EAB_ecoregions_08042025.tif", overwrite= TRUE, datatype = "INT1U")
+
+
+
+ecoreg<-rast("Data/NECN_Final_Maps/EAB_ecoregions_08042025.tif")
+soilmoist<-rast("C:/Users/lwalk/Desktop/LANDIS_SIMS/Rep6/soilmoist_09082025.tif")
+
+landscape<-vect("Data/Landscape_extent/EAB_landscape_perimeter_new.shp")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### Experimental ecoregion map with one ecoregion
+
+Read in landscape extent
+```{r}
+# Define custom projection
+albers_custom <- "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-121 +datum=NAD83 +units=m +no_defs"
+
+# Load in landscape polygon perimeter and project
+landscape<-vect("Data/Landscape_extent/EAB_landscape_perimeter.shp") %>% project(albers_custom)
+
+# Create template raster from landscape
+template <- rast(extent = ext(landscape), crs = crs(landscape), resolution=90)
+
+# Values to 1
+r <- rasterize(landscape, template, field = 1)
+
+# Fill NAs with zero to make raster a rectangle
+ecoregion_one <- ifel(is.na(r),0,r)
+
+plot(ecoregion_one)
+
+writeRaster(ecoregion_one, "Data/NECN_Final_Maps/ecoregion_one.tif", datatype= "INT1U")
+```
